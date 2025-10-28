@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>نظام حجوزات المهام</title>
+  <!-- Tailwind (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React/DOM (DEV لبناء رسائل أخطاء واضحة) -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <!-- Babel (JSX) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Recharts (اختياري) -->
+  <script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+  <!-- SheetJS / XLSX -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+  <style>table{border-collapse:collapse}th,td{border-color:#e5e7eb}</style>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-900">
+  <div id="root"></div>
+
+  <!-- طبقة إظهار الأخطاء -->
+  <div id="error-overlay" style="display:none;position:fixed;inset:0;background:#1f2937;color:#fff;padding:16px;z-index:99999;overflow:auto;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas">
+    <div style="max-width:960px;margin:0 auto">
+      <h2 style="font-size:18px;font-weight:700;margin:0 0 12px">حدث خطأ في الصفحة</h2>
+      <pre id="error-text" style="white-space:pre-wrap;word-break:break-word"></pre>
+      <button onclick="document.getElementById('error-overlay').style.display='none'" style="margin-top:12px;background:#10b981;border:none;color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer">إغلاق</button>
+    </div>
+  </div>
+  <script>
+    // التقط أي خطأ مبكر واعرضه
+    function showErr(e){
+      const box = document.getElementById('error-overlay');
+      const pre = document.getElementById('error-text');
+      pre.textContent = (e && e.stack) ? e.stack : String(e);
+      box.style.display = 'block';
+    }
+    window.onerror = function(msg,src,line,col,err){ showErr(err || msg); };
+    window.onunhandledrejection = function(ev){ showErr(ev.reason || ev); };
+  </script>
+
+  <!-- الكود (بدون اعتماد صارم على Recharts) -->
+  <script type="text/babel" data-presets="env,react">
+    const {useState,useEffect,useMemo} = React;
+
+    // ===== بولي‌فِلّات بسيطة =====
+    const uuidv4 = () => (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : 'id-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const safeReplaceAll = (str, find, repl) => String(str).split(find).join(repl);
+
+    // حاول استخدام Recharts إن وجدت
+    const R = window.Recharts || null;
+    const BarChart      = R ? R.BarChart      : (p)=>null;
+    const Bar           = R ? R.Bar           : (p)=>null;
+    const XAxis         = R ? R.XAxis         : (p)=>null;
+    const YAxis         = R ? R.YAxis         : (p)=>null;
+    const Tooltip       = R ? R.Tooltip       : (p)=>null;
+    const ResponsiveContainer = R ? R.ResponsiveContainer : (p)=> <div style={{width:'100%',height:'100%'}}>{p.children}</div>;
+    const CartesianGrid = R ? R.CartesianGrid : (p)=>null;
+
+    // ===== إعدادات =====
+    const STORAGE_KEY = "bookings_v1";
+    const ADMIN_PIN = "Saad1994121";
+    const STATUS = { PENDING:"قيد الانتظار", DONE:"مكتمل", CANCELED:"ملغى" };
+
+    // ===== أدوات =====
+    const loadBookings = () => {
+      try { const raw = localStorage.getItem(STORAGE_KEY); return raw ? JSON.parse(raw) : []; }
+      catch(e){ console.warn(e); return []; }
+    };
+    const saveBookings = (rows) => localStorage.setItem(STORAGE_KEY, JSON.stringify(rows));
+    const toCSV = (rows) => {
+      const headers = ["queue","createdAt","studentName","schoolName","taskTitle","specialization","phone","preferredDate","notes","status"];
+      const lines = [headers.join(",")];
+      rows.forEach(r=>{
+        const vals = headers.map(h => `"${safeReplaceAll(r[h] ?? "", '"', '""')}"`);
+        lines.push(vals.join(","));
+      });
+      return lines.join("\n");
+    };
+    const downloadText = (filename, text) => {
+      const blob = new Blob([text], {type:"text/csv;charset=utf-8;"});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a"); a.href=url; a.download=filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    };
+
+    // ===== مكونات صغيرة =====
+    const Field = ({ label, value, onChange, type="text", required=false, className="" }) => (
+      <label className={`flex flex-col gap-1 ${className}`}>
+        <span className="text-sm text-slate-600">{label}</span>
+        <input required={required} type={type} value={value} onChange={(e)=>onChange(e.target.value)} className="border rounded-xl p-3 outline-none focus:ring" />
+      </label>
+    );
+    const TextArea = ({ label, value, onChange, className="" }) => (
+      <label className={`flex flex-col gap-1 ${className}`}>
+        <span className="text-sm text-slate-600">{label}</span>
+        <textarea value={value} onChange={(e)=>onChange(e.target.value)} className="border rounded-xl p-3 outline-none focus:ring min-h-[120px]" />
+      </label>
+    );
+    const Stat = ({title,value}) => (<div className="rounded-2xl border p-4"><div className="text-xs text-slate-500">{title}</div><div className="text-2xl font-bold mt-1">{value}</div></div>);
+    const Badge = ({label, className=""}) => (<span className={`inline-flex px-2 py-1 rounded-lg text-xs ${className}`}>{label}</span>);
+    const Th = ({children}) => (<th className="text-xs text-slate-500 font-semibold pb-2">{children}</th>);
+    const Td = ({children,className="",colSpan}) => (<td colSpan={colSpan} className={`py-3 align-top ${className}`}>{children}</td>);
+
+    // ===== أيقونات بسيطة =====
+    const Icon = ({d,w=20,h=20}) => <svg className={`w-[${w}px] h-[${h}px]`} viewBox="0 0 24 24" fill="none" stroke="currentColor"><path strokeWidth="2" strokeLinecap="round" d={d}/></svg>;
+    const IPlus   = () => <Icon d="M12 5v14M5 12h14"/>;
+    const IDown   = () => <Icon d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/>;
+    const ICopy   = () => (<svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="9" y="9" width="13" height="13" rx="2" strokeWidth="2"/><rect x="2" y="2" width="13" height="13" rx="2" strokeWidth="2"/></svg>);
+    const ITrash  = () => <Icon d="M3 6h18M8 6V4h8v2m-1 0v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V6h10z"/>;
+    const ILogin  = () => <Icon d="M10 17l5-5-5-5M15 12H3M21 4v16"/>;
+    const ILogout = () => <Icon d="M14 7l5 5-5 5M19 12H7M3 4v16"/>;
+    const IFilter = () => <Icon d="M3 4h18l-7 8v6l-4 2v-8L3 4z"/>;
+    const ICheck  = () => <Icon d="M5 12l5 5L20 7"/>;
+    const IX      = () => <Icon d="M6 18L18 6M6 6l12 12"/>;
+    const IClock  = () => (<svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="9" strokeWidth="2"/><path strokeWidth="2" strokeLinecap="round" d="M12 7v5l3 3"/></svg>);
+
+    // ===== التطبيق =====
+    function App(){
+      const [tab, setTab] = useState("form");
+      const [bookings, setBookings] = useState([]);
+      const [isAuthed, setIsAuthed] = useState(false);
+
+      const [studentName, setStudentName] = useState("");
+      const [schoolName, setSchoolName] = useState("");
+      const [taskTitle, setTaskTitle] = useState("");
+      const [specialization, setSpecialization] = useState("");
+      const [phone, setPhone] = useState("");
+      const [preferredDate, setPreferredDate] = useState("");
+      const [notes, setNotes] = useState("");
+      const [successMsg, setSuccessMsg] = useState("");
+
+      const [q, setQ] = useState("");
+      const [filterSchool, setFilterSchool] = useState("");
+      const [filterSpec, setFilterSpec] = useState("");
+      const [filterStatus, setFilterStatus] = useState("");
+
+      useEffect(()=>{ setBookings(loadBookings()); },[]);
+
+      const nextQueue = useMemo(()=> bookings.length ? bookings.reduce((m,r)=>Math.max(m,Number(r.queue||0)),0)+1 : 1, [bookings]);
+
+      const schools = useMemo(()=>Array.from(new Set(bookings.map(b=>b.schoolName).filter(Boolean))),[bookings]);
+      const specs   = useMemo(()=>Array.from(new Set(bookings.map(b=>b.specialization).filter(Boolean))),[bookings]);
+
+      function handleSubmit(e){
+        e.preventDefault();
+        if(!studentName.trim() || !schoolName.trim() || !taskTitle.trim() || !specialization.trim()){
+          alert("يرجى تعبئة الحقول الإجبارية."); return;
+        }
+        const row = {
+          id: uuidv4(),
+          queue: nextQueue,
+          createdAt: new Date().toISOString(),
+          studentName: studentName.trim(),
+          schoolName: schoolName.trim(),
+          taskTitle: taskTitle.trim(),
+          specialization: specialization.trim(),
+          phone: phone.trim(),
+          preferredDate,
+          notes: notes.trim(),
+          status: STATUS.PENDING,
+        };
+        const newRows = [...bookings, row].sort((a,b)=> new Date(a.createdAt)-new Date(b.createdAt));
+        setBookings(newRows); saveBookings(newRows);
+        setStudentName(""); setSchoolName(""); setTaskTitle(""); setSpecialization("");
+        setPhone(""); setPreferredDate(""); setNotes("");
+        setSuccessMsg(`شكراً لك للحجز! سوف يتم التواصل معك عند الانتهاء من العمل في طلبك. رقم دورك: ${row.queue}`);
+      }
+      function removeRow(id){
+        if(!confirm("سيتم حذف هذا الحجز. هل أنت متأكد؟")) return;
+        const newRows = bookings.filter(b=>b.id!==id);
+        setBookings(newRows); saveBookings(newRows);
+      }
+      function updateStatus(id, status){
+        const newRows = bookings.map(b=> b.id===id ? {...b, status} : b );
+        setBookings(newRows); saveBookings(newRows);
+      }
+      function exportCSV(){
+        const csv = toCSV(bookings);
+        downloadText(`bookings_${new Date().toISOString().slice(0,10)}.csv`, csv);
+      }
+      async function copyCSV(){
+        const csv = toCSV(bookings);
+        await navigator.clipboard.writeText(csv);
+        alert("تم النسخ إلى الحافظة كـ CSV");
+      }
+      function clearAll(){
+        if(!confirm("سيتم مسح جميع الحجوزات من الجهاز الحالي فقط. متأكد؟")) return;
+        setBookings([]); saveBookings([]);
+      }
+      function exportExcel(){
+        const rows = bookings.map(r=>({
+          "الدور": r.queue,
+          "الإنشاء": new Date(r.createdAt).toLocaleString(),
+          "اسم الطالب": r.studentName,
+          "المدرسة": r.schoolName,
+          "المهمة": r.taskTitle,
+          "التخصص": r.specialization,
+          "الهاتف": r.phone,
+          "موعد مرغوب": r.preferredDate ? new Date(r.preferredDate).toLocaleString() : "",
+          "ملاحظات": r.notes,
+          "الحالة": r.status,
+        }));
+        const ws = XLSX.utils.json_to_sheet(rows);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "الحجوزات");
+        XLSX.writeFile(wb, `bookings_${new Date().toISOString().slice(0,10)}.xlsx`);
+      }
+
+      const filtered = useMemo(()=>{
+        const query = q.trim().toLowerCase();
+        return bookings
+          .filter(b=> filterSchool ? b.schoolName===filterSchool : true)
+          .filter(b=> filterSpec ? b.specialization===filterSpec : true)
+          .filter(b=> filterStatus ? b.status===filterStatus : true)
+          .filter(b=>{
+            if(!query) return true;
+            const hay = `${b.studentName} ${b.schoolName} ${b.taskTitle} ${b.specialization} ${b.phone} ${b.notes}`.toLowerCase();
+            return hay.includes(query);
+          })
+          .sort((a,b)=> new Date(a.createdAt)-new Date(b.createdAt));
+      },[bookings,q,filterSchool,filterSpec,filterStatus]);
+
+      const stats = useMemo(()=>{
+        const total = filtered.length;
+        const byStatus = {
+          [STATUS.PENDING]:  filtered.filter(r=>r.status===STATUS.PENDING).length,
+          [STATUS.DONE]:     filtered.filter(r=>r.status===STATUS.DONE).length,
+          [STATUS.CANCELED]: filtered.filter(r=>r.status===STATUS.CANCELED).length,
+        };
+        const uniqueSchools = new Set(filtered.map(r=>r.schoolName)).size;
+        const uniqueSpecs   = new Set(filtered.map(r=>r.specialization)).size;
+        const map = new Map();
+        filtered.forEach(r=> map.set(r.specialization, (map.get(r.specialization)||0)+1));
+        const bySpecData = Array.from(map).map(([name,count])=>({name,count}));
+        return { total, byStatus, uniqueSchools, uniqueSpecs, bySpecData };
+      },[filtered]);
+
+      const AdminGate = () => {
+        const [pin, setPin] = useState("");
+        if (isAuthed) return null;
+        return (
+          <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center z-50">
+            <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-xl">
+              <div className="flex items-center gap-2 mb-4"><ILogin /><h3 className="text-lg font-semibold">تسجيل الدخول للوحة التحكم</h3></div>
+              <label className="block text-sm mb-1">أدخل رمز PIN</label>
+              <input type="password" className="w-full border rounded-xl p-3 outline-none focus:ring" placeholder="••••••••" value={pin} onChange={(e)=>setPin(e.target.value)} />
+              <button onClick={()=>{ if(pin===ADMIN_PIN) setIsAuthed(true); else alert("رمز غير صحيح"); }} className="mt-4 w-full rounded-xl p-3 bg-indigo-600 text-white hover:bg-indigo-700">دخول</button>
+            </div>
+          </div>
+        );
+      };
+
+      return (
+        <div>
+          <header className="sticky top-0 z-40 bg-white border-b">
+            <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center justify-center w-9 h-9 rounded-xl bg-indigo-600 text-white">Q</span>
+                <div><h1 className="text-lg font-bold">نظام حجوزات المهام</h1><p className="text-xs text-slate-500">ترتيب حسب الدور • حفظ محلي • تصدير CSV / Excel</p></div>
+              </div>
+              <nav className="flex items-center gap-2">
+                <button onClick={()=>setTab("form")}  className={`px-4 py-2 rounded-xl ${tab==="form"  ? "bg-slate-900 text-white" : "bg-slate-200"}`}>نموذج الحجز</button>
+                <button onClick={()=>setTab("admin")} className={`px-4 py-2 rounded-xl ${tab==="admin" ? "bg-slate-900 text-white" : "bg-slate-200"}`}>لوحة التحكم</button>
+              </nav>
+            </div>
+          </header>
+
+          <main className="max-w-6xl mx-auto px-4 py-6">
+            {tab==="form" ? (
+              <section className="bg-white rounded-2xl p-6 shadow-sm border">
+                <h2 className="text-xl font-semibold mb-4 flex items-center gap-2"><IPlus/> إنشاء حجز جديد</h2>
+                {successMsg && (
+                  <div className="mb-4 p-4 rounded-xl bg-emerald-50 text-emerald-800 border border-emerald-200 flex items-start justify-between gap-4">
+                    <div>{successMsg}</div>
+                    <button onClick={()=>setSuccessMsg("")} className="text-sm underline">إغلاق</button>
+                  </div>
+                )}
+                <form onSubmit={handleSubmit} className="grid md:grid-cols-2 gap-4">
+                  <Field label="اسم الطالب *" value={studentName} onChange={setStudentName} required/>
+                  <Field label="اسم المدرسة *" value={schoolName} onChange={setSchoolName} required/>
+                  <Field label="اسم/وصف المهمة *" value={taskTitle} onChange={setTaskTitle} required/>
+                  <Field label="التخصص المطلوب *" value={specialization} onChange={setSpecialization} required/>
+                  <Field label="رقم الهاتف" value={phone} onChange={setPhone} type="tel"/>
+                  <Field label="تاريخ/وقت مرغوب" value={preferredDate} onChange={setPreferredDate} type="datetime-local"/>
+                  <TextArea className="md:col-span-2" label="ملاحظات" value={notes} onChange={setNotes}/>
+                  <div className="md:col-span-2 flex items-center justify-between gap-2">
+                    <p className="text-sm text-slate-500 flex items-center gap-2"><IClock/> رقم الدور التالي: <span className="font-semibold">{nextQueue}</span></p>
+                    <button type="submit" className="rounded-xl px-5 py-3 bg-indigo-600 text-white hover:bg-indigo-700">حجز الآن</button>
+                  </div>
+                </form>
+              </section>
+            ) : (
+              <section className="space-y-6">
+                {!isAuthed && <AdminGate />}
+
+                <div className="bg-white rounded-2xl p-6 shadow-sm border">
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-xl font-semibold">نظرة عامة</h2>
+                    <div className="flex items-center gap-2">
+                      <button onClick={exportCSV}  className="rounded-xl px-4 py-2 bg-slate-900 text-white hover:bg-slate-800 flex items-center gap-2"><IDown/> تصدير CSV</button>
+                      <button onClick={exportExcel} className="rounded-xl px-4 py-2 bg-green-600 text-white hover:bg-green-700 flex items-center gap-2"><IDown/> تصدير Excel</button>
+                      <button onClick={copyCSV}    className="rounded-xl px-4 py-2 bg-slate-200 hover:bg-slate-300 flex items-center gap-2"><ICopy/> نسخ</button>
+                      <button onClick={clearAll}   className="rounded-xl px-4 py-2 bg-red-100 text-red-700 hover:bg-red-200 flex items-center gap-2"><ITrash/> مسح الكل</button>
+                    </div>
+                  </div>
+
+                  <div className="grid md:grid-cols-4 gap-4">
+                    <Stat title="إجمالي الحجوزات" value={stats.total}/>
+                    <Stat title="مدارس مميّزة" value={stats.uniqueSchools}/>
+                    <Stat title="تخصصات مميّزة" value={stats.uniqueSpecs}/>
+                    <div className="rounded-2xl border p-4">
+                      <div className="text-xs text-slate-500 mb-2">حسب الحالة</div>
+                      <div className="flex items-center gap-4 text-sm">
+                        <Badge className="bg-amber-100 text-amber-800"  label={`${STATUS.PENDING}: ${stats.byStatus[STATUS.PENDING]}`}/>
+                        <Badge className="bg-emerald-100 text-emerald-800" label={`${STATUS.DONE}: ${stats.byStatus[STATUS.DONE]}`}/>
+                        <Badge className="bg-rose-100 text-rose-800"     label={`${STATUS.CANCELED}: ${stats.byStatus[STATUS.CANCELED]}`}/>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl p-6 shadow-sm border">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-semibold flex items-center gap-2"><IFilter/> تصفية وبحث</h3>
+                    {isAuthed ? (
+                      <button onClick={()=>setIsAuthed(false)} className="rounded-xl px-3 py-2 bg-slate-200 hover:bg-slate-300 flex items-center gap-2"><ILogout/> خروج</button>
+                    ) : (
+                      <div className="text-xs text-slate-500">(تحتاج تسجيل دخول لتعديل الحالات أو الحذف)</div>
+                    )}
+                  </div>
+                  <div className="grid md:grid-cols-4 gap-3">
+                    <input className="border rounded-xl p-3" placeholder="بحث عام (اسم/مدرسة/مهمة/تخصص)" value={q} onChange={e=>setQ(e.target.value)} />
+                    <select className="border rounded-xl p-3" value={filterSchool} onChange={e=>setFilterSchool(e.target.value)}>
+                      <option value="">كل المدارس</option>
+                      {schools.map(s=><option key={s} value={s}>{s}</option>)}
+                    </select>
+                    <select className="border rounded-xl p-3" value={filterSpec} onChange={e=>setFilterSpec(e.target.value)}>
+                      <option value="">كل التخصصات</option>
+                      {specs.map(s=><option key={s} value={s}>{s}</option>)}
+                    </select>
+                    <select className="border rounded-xl p-3" value={filterStatus} onChange={e=>setFilterStatus(e.target.value)}>
+                      <option value="">كل الحالات</option>
+                      <option value={STATUS.PENDING}>{STATUS.PENDING}</option>
+                      <option value={STATUS.DONE}>{STATUS.DONE}</option>
+                      <option value={STATUS.CANCELED}>{STATUS.CANCELED}</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl p-6 shadow-sm border overflow-auto">
+                  <h3 className="font-semibold mb-4">توزيع الحجوزات حسب التخصص {R ? "" : "(الرسوم غير متاحة)"}</h3>
+                  <div className="w-full h-72">
+                    {R ? (
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={stats.bySpecData}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="name" />
+                          <YAxis allowDecimals={false} />
+                          <Tooltip />
+                          <Bar dataKey="count" />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-slate-500 text-sm">
+                        تعذّر تحميل مكتبة الرسوم Recharts من الـCDN
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl p-6 shadow-sm border overflow-auto">
+                  <h3 className="font-semibold mb-4">الجدول التفصيلي (مرتب حسب الدور)</h3>
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-right">
+                        <Th>الدور</Th><Th>الإنشاء</Th><Th>اسم الطالب</Th><Th>المدرسة</Th><Th>المهمة</Th><Th>التخصص</Th><Th>الهاتف</Th><Th>موعد مرغوب</Th><Th>ملاحظات</Th><Th>الحالة</Th>{isAuthed && <Th>إجراءات</Th>}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.map(r=>(
+                        <tr key={r.id} className="border-t">
+                          <Td>{r.queue}</Td>
+                          <Td>{new Date(r.createdAt).toLocaleString()}</Td>
+                          <Td className="font-medium">{r.studentName}</Td>
+                          <Td>{r.schoolName}</Td>
+                          <Td>{r.taskTitle}</Td>
+                          <Td>{r.specialization}</Td>
+                          <Td dir="ltr">{r.phone}</Td>
+                          <Td>{r.preferredDate ? new Date(r.preferredDate).toLocaleString() : "—"}</Td>
+                          <Td>{r.notes || "—"}</Td>
+                          <Td><span className={`px-2 py-1 rounded-lg text-xs ${r.status==="قيد الانتظار"?"bg-amber-100 text-amber-800":r.status==="مكتمل"?"bg-emerald-100 text-emerald-800":"bg-rose-100 text-rose-800"}`}>{r.status}</span></Td>
+                          {isAuthed && (
+                            <Td>
+                              <div className="flex items-center gap-2">
+                                <button onClick={()=>updateStatus(r.id, STATUS.DONE)} title="وضع مكتمل" className="p-2 rounded-lg bg-emerald-100 text-emerald-700 hover:bg-emerald-200"><ICheck/></button>
+                                <button onClick={()=>updateStatus(r.id, STATUS.CANCELED)} title="إلغاء" className="p-2 rounded-lg bg-rose-100 text-rose-700 hover:bg-rose-200"><IX/></button>
+                                <button onClick={()=>removeRow(r.id)} title="حذف" className="p-2 rounded-lg bg-slate-200 hover:bg-slate-300"><ITrash/></button>
+                              </div>
+                            </Td>
+                          )}
+                        </tr>
+                      ))}
+                      {filtered.length===0 && (
+                        <tr><Td colSpan={isAuthed ? 11 : 10} className="text-center text-slate-500 py-6">لا توجد نتائج مطابقة.</Td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            )}
+          </main>
+
+          <footer className="py-6 text-center text-xs text-slate-500">
+            نسخة عرض تجريبية — التخزين محلي على جهازك. رمز لوحة التحكم: <span className="font-semibold">{ADMIN_PIN}</span>
+          </footer>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
